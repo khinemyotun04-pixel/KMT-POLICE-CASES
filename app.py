@@ -4,11 +4,16 @@ import streamlit as st
 import hashlib
 import os
 from io import BytesIO
+from argon2 import PasswordHasher, exceptions as argon2_exceptions
+
+# Initialize argon2 hasher
+ph = PasswordHasher()
 
 # --- Helper functions for user management ---
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    # Use argon2 to hash passwords (includes salt and parameters)
+    return ph.hash(password)
 
 
 def get_user(conn, username: str):
@@ -34,6 +39,56 @@ def add_user(conn, username: str, password: str):
         (username, hash_password(password)),
     )
     conn.commit()
+
+
+def verify_and_migrate_password(conn, username: str, provided_password: str) -> bool:
+    """
+    Verify provided_password against stored hash.
+    If stored password was an old SHA-256 hash, rehash with argon2 and update DB.
+    Returns True if verification succeeds, False otherwise.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    user_id, stored_hash = row
+
+    # Detect old SHA-256 (hex length 64)
+    is_old_sha256 = isinstance(stored_hash, str) and len(stored_hash) == 64 and all(
+        c in "0123456789abcdef" for c in stored_hash.lower()
+    )
+
+    if is_old_sha256:
+        # verify against SHA-256
+        if hashlib.sha256(provided_password.encode("utf-8")).hexdigest() == stored_hash:
+            # migrate: create new argon2 hash and save
+            new_hash = ph.hash(provided_password)
+            cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, user_id))
+            conn.commit()
+            return True
+        else:
+            return False
+    else:
+        # stored_hash is argon2 (or other). Verify with argon2
+        try:
+            ok = ph.verify(stored_hash, provided_password)
+            # If argon2 says it's valid but needs rehash (parameters changed), rehash
+            try:
+                if ph.check_needs_rehash(stored_hash):
+                    cur.execute(
+                        "UPDATE users SET password_hash = ? WHERE id = ?",
+                        (ph.hash(provided_password), user_id),
+                    )
+                    conn.commit()
+            except Exception:
+                # check_needs_rehash may raise for non-argon hashes; ignore
+                pass
+            return ok
+        except argon2_exceptions.VerifyMismatchError:
+            return False
+        except Exception:
+            return False
 
 
 # Page Configuration
@@ -109,8 +164,8 @@ if not st.session_state["logged_in"] and create_admin_if_missing(conn):
         password = st.text_input("စကားဝှက်", type="password")
         login_btn = st.form_submit_button("ဝင်မည်")
         if login_btn:
-            user = get_user(conn, username.strip())
-            if user and hash_password(password) == user[2]:
+            ok = verify_and_migrate_password(conn, username.strip(), password)
+            if ok:
                 st.session_state["logged_in"] = True
                 st.session_state["username"] = username.strip()
                 st.sidebar.success(f"ကြိုဆိုပါတယ် — {st.session_state['username']}")
@@ -154,7 +209,7 @@ with col_left:
 with col_right:
     if st.session_state.get("logged_in"):
         st.markdown(f"### ကြိုဆိုပါတယ် — {st.session_state['username']}")
-    st.markdown("## အမှုတွ�� မှတ်တမ်းစနစ်")
+    st.markdown("## အမှုတွဲ မှတ်တမ်းစနစ်")
 
 st.markdown("---")
 
@@ -164,7 +219,7 @@ if not st.session_state.get("logged_in"):
     st.stop()
 
 # --- Main app (same functionality as before) ---
-menu = ["အမှုအသစ်ထည့်ရန်", "အမှုများကြည့်ရှုရန်/ရှာဖွေရန်", "စာရင်းအင်းအချက်အလက်"]
+menu = ["အမှုအသစ်ထည့်ရန်", "အမှုမ���ားကြည့်ရှုရန်/ရှာဖွေရန်", "စာရင်းအင်းအချက်အလက်"]
 choice = st.sidebar.selectbox("လုပ်ဆောင်ချက် ရွေးချယ်ရန်", menu)
 
 if choice == "အမှုအသစ်ထည့်ရန်":
